@@ -93,3 +93,7 @@ This is a course-project implementation and portfolio artifact, not a claim of o
 ## Notes
 
 The original experiment folder contained datasets, pretrained CLIP weights, checkpoints, generated outputs, and unrelated research assets. They are intentionally excluded so this repository stays focused on the implementation itself.
+
+## License
+
+MIT License. See `LICENSE`. Third-party libraries, pretrained models and datasets retain their own licenses and terms.
