@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Training outputs / checkpoints
+results/
+models/
+*.pt
+*.pth
+*.ckpt
+
+# Datasets and generated evaluation files
+RSTPReid_new/
+imgs/
+data_captions.json
+gen_testcaption.json
+refer_testcaption.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
