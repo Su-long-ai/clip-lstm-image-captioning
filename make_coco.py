@@ -1,91 +1,82 @@
-import os
+from __future__ import annotations
+
+import argparse
 import json
 import shutil
+from pathlib import Path
 
-# 1. 创建符合实验代码要求的全部标准目录（新增 val2014 文件夹）
-os.makedirs('RSTPReid_new/annotations', exist_ok=True)
-os.makedirs('RSTPReid_new/train2014', exist_ok=True)
-os.makedirs('RSTPReid_new/val2014', exist_ok=True)
-os.makedirs('RSTPReid_new/test2014', exist_ok=True)
+SPLITS = ("train", "val", "test")
+IMAGE_KEYS = ("img_path", "image_path", "image_name", "img_name", "file_name")
 
-source_json = 'data_captions.json'
-source_img_dir = 'imgs'  # 对应你现有的图片文件夹
 
-if not os.path.exists(source_json):
-    print(f"❌ 错误：未在当前目录下找到 {source_json}，请确认原始标注文件名！")
-    exit()
-if not os.path.exists(source_img_dir):
-    print(f"❌ 错误：未在当前目录下找到 {source_img_dir} 文件夹！")
-    exit()
+def convert_records(records: list[dict]) -> dict[str, dict[str, list[dict]]]:
+    outputs = {split: {"images": [], "annotations": []} for split in SPLITS}
+    annotation_id = 0
+    for index, item in enumerate(records):
+        split = str(item.get("split", "train")).lower()
+        if split not in outputs:
+            raise ValueError(f"Unsupported split {split!r} at record {index}")
+        image_id = item.get("id", item.get("img_id", index))
+        filename = next((item.get(key) for key in IMAGE_KEYS if item.get(key)), None)
+        if filename is None:
+            raise ValueError(f"Record {index} has no image filename; checked keys {IMAGE_KEYS}")
+        filename = str(filename)
+        outputs[split]["images"].append({"id": image_id, "file_name": filename})
+        for caption in item.get("captions", []):
+            outputs[split]["annotations"].append(
+                {"id": annotation_id, "image_id": image_id, "caption": str(caption)}
+            )
+            annotation_id += 1
+    return outputs
 
-with open(source_json, 'r', encoding='utf-8') as f:
-    data = json.load(f)
 
-# 初始化 3 个独立的 COCO 格式容器
-train_coco = {"images": [], "annotations": []}
-val_coco = {"images": [], "annotations": []}
-test_coco = {"images": [], "annotations": []}
+def find_image(source_root: Path, relative_name: str) -> Path | None:
+    direct = source_root / relative_name
+    if direct.is_file():
+        return direct
+    basename = Path(relative_name).name
+    return next((path for path in source_root.rglob(basename) if path.is_file()), None)
 
-ann_id = 0
-print("正在为你严格切分【训练/验证/测试】三路数据集并自动分流图片，请稍候...")
 
-for idx, item in enumerate(data):
-    split = item.get('split', 'train')
+def export_dataset(source_json: Path, source_images: Path, output_root: Path) -> dict[str, int]:
+    records = json.loads(source_json.read_text(encoding="utf-8"))
+    if not isinstance(records, list):
+        raise ValueError("Source JSON must be a list of image/caption records")
+    converted = convert_records(records)
+    annotations_dir = output_root / "annotations"
+    annotations_dir.mkdir(parents=True, exist_ok=True)
 
-    img_id = item.get('id') if item.get('id') is not None else item.get('img_id', idx)
-    image_path = item.get('img_path') or item.get('image_path') or item.get('image_name') or item.get(
-        'img_name') or item.get('file_name')
-    captions = item.get('captions', [])
+    copied = {split: 0 for split in SPLITS}
+    for split in SPLITS:
+        image_dir = output_root / f"{split}2014"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        for image in converted[split]["images"]:
+            source = find_image(source_images, image["file_name"])
+            if source is None:
+                raise FileNotFoundError(f"Image not found for {image['file_name']!r}")
+            destination = image_dir / Path(image["file_name"]).name
+            shutil.copy2(source, destination)
+            image["file_name"] = destination.name
+            copied[split] += 1
+        annotation_path = annotations_dir / f"captions_{split}2014.json"
+        annotation_path.write_text(json.dumps(converted[split], ensure_ascii=False, indent=2), encoding="utf-8")
+    return copied
 
-    if image_path is None:
-        print(f"\n❌ 错误：在数据第 {idx} 个条目中找不到任何代表图片文件名的键！")
-        print(f"该条目实际包含的键名为: {list(item.keys())}")
-        exit()
 
-    image_info = {"id": img_id, "file_name": image_path}
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Convert split image/caption records to a COCO-style directory layout")
+    parser.add_argument("--source-json", type=Path, required=True)
+    parser.add_argument("--source-images", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
 
-    # 🎯 严格判定并分流到对应的文件夹和 JSON 容器中
-    if split == 'train':
-        target_coco = train_coco
-        target_img_folder = 'RSTPReid_new/train2014'
-    elif split == 'val':
-        target_coco = val_coco
-        target_img_folder = 'RSTPReid_new/val2014'
-    elif split == 'test':
-        target_coco = test_coco
-        target_img_folder = 'RSTPReid_new/test2014'
-    else:
-        target_coco = train_coco
-        target_img_folder = 'RSTPReid_new/train2014'
 
-    target_coco["images"].append(image_info)
+def main() -> int:
+    args = parse_args()
+    counts = export_dataset(args.source_json, args.source_images, args.output)
+    print(" ".join(f"{split}={count}" for split, count in counts.items()))
+    return 0
 
-    for cap in captions:
-        target_coco["annotations"].append({
-            "id": ann_id,
-            "image_id": img_id,
-            "caption": cap
-        })
-        ann_id += 1
 
-    # 自动将图片分流复制到特定的 train2014 / val2014 / test2014 文件夹下
-    src_img_path = os.path.join(source_img_dir, image_path)
-    if os.path.exists(src_img_path):
-        shutil.copy(src_img_path, os.path.join(target_img_folder, image_path))
-    else:
-        found = False
-        for root, dirs, files in os.walk(source_img_dir):
-            if image_path in files:
-                shutil.copy(os.path.join(root, image_path), os.path.join(target_img_folder, image_path))
-                found = True
-                break
-
-# 写入标准 COCO 格式的 JSON（保持 ensure_ascii=True 防止 GBK 报错）
-with open('RSTPReid_new/annotations/captions_train2014.json', 'w', encoding='utf-8') as f:
-    json.dump(train_coco, f, ensure_ascii=True, indent=4)
-with open('RSTPReid_new/annotations/captions_val2014.json', 'w', encoding='utf-8') as f:
-    json.dump(val_coco, f, ensure_ascii=True, indent=4)
-with open('RSTPReid_new/annotations/captions_test2014.json', 'w', encoding='utf-8') as f:
-    json.dump(test_coco, f, ensure_ascii=True, indent=4)
-
-print("🎉 恭喜！完美的【训练+验证+测试】三路数据集重构全部完成！")
+if __name__ == "__main__":
+    raise SystemExit(main())

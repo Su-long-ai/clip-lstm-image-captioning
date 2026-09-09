@@ -1,323 +1,288 @@
+from __future__ import annotations
+
 import argparse
-import os
-import time
-
 import logging
-import torch.nn as nn
-import torch.backends.cudnn as cudnn
-
 import math
-from torch.nn.utils import clip_grad_norm_
-from torch.nn.utils.rnn import pack_padded_sequence
-from torch.optim import Optimizer
-from data import build_vocab, get_coco_data, get_iterator
-from model import CaptionClipModel
-from utils import setup_logging, AverageMeter, select_optimizer
-from torchvision.models import resnet
-
-from torch.cuda.amp import autocast, GradScaler
-
-import torch
+import os
+import random
+import time
+from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
-import random
-
+import torch
+import torch.nn as nn
 from rich.console import Console
+from torch.nn.utils import clip_grad_norm_
+from torch.nn.utils.rnn import pack_padded_sequence
+
+from data import build_vocab, get_coco_data, get_iterator
+from utils import AverageMeter, select_optimizer, setup_logging
 
 console = Console()
 
-model_names = sorted(name for name in resnet.__dict__
-                     if name.islower() and not name.startswith("__")
-                     and callable(resnet.__dict__[name]))
-
-parser = argparse.ArgumentParser(description='COCO caption genration training')
-
-# 模型参数: 使用Vision Transformer还是Resnet作为CLIP的图像编码器部分
-# 具体可在python控制台中输入`import clip;clip.available_models()`来查看可用的模型, 并在网络上根据名称搜索模型的特点
-parser.add_argument('--encoder_model', '-e', default='ViT-B/32', type=str, help='name of image encoder model to be used', choices=['RN50', 'RN101', 'RN50x4', 'RN50x16', 'RN50x64', 'ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'ViT-L/14@336px'])
-# 模型参数: 设置词嵌入向量的维度大小为256, 表示使用256个数字来表示一个词token
-parser.add_argument('--embedding_size', default=256, type=int,
-                    help='size of word embedding used')
-# 模型参数: RNN部分, 设置RNN一个隐状态存储的特征数量, 过高可能可以表示更丰富的信息, 但可能稀释记忆; 过低则可能无法学到有效的隐状态
-parser.add_argument('--rnn_size', default=256, type=int,
-                    help='size of rnn hidden layer')
-# 模型参数: RNN部分, 设置RNN的层数。如果大于1, 则会形成堆叠LSTM, 后面的LSTM就会使用前面的LSTM的输出作为输入, 进一步计算隐状态并得到最终输出
-parser.add_argument('--num_layers', default=2, type=int,
-                    help='number of rnn layers to use')
-# 模型参数: RNN部分, 设置一层LSTM输入的最大时间步, 决定数据集中一个样本最终可以输进LSTM的词长度, 也间接决定生成时的句子长度
-parser.add_argument('--max_length', default=30, type=int,
-                    help='maximum time length to feed')
-# 训练参数: 张量的类型, 决定训练数据精度和数据类型, 不同精度对资源需求不同, 效果也不同。决定精度需量力而行, 可参考: docs.pytorch.org/docs/stable/tensors.html
-parser.add_argument('--type', default='torch.cuda.FloatTensor',
-                    help='type of tensor - e.g torch.cuda.HalfTensor')
-# 训练参数: 微调的阶段数, 决定解冻的层数变化策略。默认为4, 表示每多一个阶段解冻的层数多25%
-parser.add_argument('--finetune_stage', default=4, type=int,
-                    help='finetune stages of CLIP, For progressive finetuning.')
-# 训练参数: 开始训练的epoch位置。若不为0, 则从指定的epoch数继续训练。推荐于中断训练后重新开始时使用
-parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
-# 训练参数: 优化器类型。推荐从SGD, AdamW, Adam和RMSProp中选择, 这些预设了机制可以指定特定的参数, 你也可以拓展更多的参数, 详见utils.py中的select_optimizer和_get_optimizer_hyper_params函数
-parser.add_argument('--optimizer', default='SGD', type=str, metavar='OPT',
-                    help='optimizer function used')
-# 训练参数: 梯度裁剪强度。更高的值有助于防止CLIP梯度爆炸, 但同时也会降低学习收敛速度
-parser.add_argument('--grad_clip', default=6., type=float,
-                    help='gradient max norm')
-# 训练参数: 是否共享embedding层和classifer层的权重
-parser.add_argument('--share_weights', default=False, type=bool,
-                    help='share embedder and classifier weights')
-# 训练参数: 数据加载线程数, 越高则加载数据的速度越快, 但更消耗资源。默认为0表示不使用多加载器
-parser.add_argument('-j', '--workers', default=0, type=int, metavar='N', help='number of data loading workers (default: 0)')
-# 训练参数: 训练轮数, 不建议过小, CLIP的微调需要时间
-parser.add_argument('--epochs', default=40, type=int, metavar='N', help='number of total epochs to run')
-# 训练参数: 训练batch size, 可能需要修改: 因显存大小而异, 当报错显存不足(CUDA Out of Memory)时可以适当调小一点。建议是2的整数次方, 利于显存对齐, 提高训练效率
-parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N', help='mini-batch size (default: 64)')
-# 训练参数: 验证batch_size, 同上batch_size, 可能需要修改
-parser.add_argument('-eb', '--eval_batch_size', default=32, type=int, metavar='N', help='mini-batch size (default: 32)')
-# 训练参数: 基础学习率, 请确保学习率足够小, 因为我们涉及到微调CLIP这样的大规模预训练模型。这里的5e-3是除了CLIP以外模型的其他部分的学习率,
-# CLIP的学习率会自动在这个基础上乘以1/200。
-parser.add_argument('--lr', '--learning_rate', default=5e-3, type=float, metavar='LR', help='initial learning rate')
-# 训练参数: 动量设置
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
-# 训练参数: 权重衰减设置
-parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W', help='weight decay (default: 1e-4)')
-# 训练参数: Alpha参数设置: 只会对RMSprop优化器生效
-parser.add_argument('--alpha', default=0.99, type=float, help='smoothing constant for RMSprop')
-# 训练参数: 是否对SGD优化器启用动量, 只有优化器是SGD并且momentum不是0时生效
-parser.add_argument('--enable_sgd_momentum', default=True, type=bool, help='Enable momentum parameter for SGD optimizer, only effective when optimizer is set to SGD and momentum is not 0')
-# 环境参数: 每隔多少个step打印一次训练过程信息
-parser.add_argument('--print_freq', '-p', default=20, type=int,
-                    metavar='N', help='print frequency (default: 10)')
-# 环境参数: 保存路径根目录
-parser.add_argument('--results_dir', metavar='RESULTS_DIR', default='./results',
-                    help='results dir')
-# 环境参数: 保存路径中用于存储模型的子文件夹
-parser.add_argument('--save', metavar='SAVE', default='',
-                    help='saved folder')
-# 环境参数: 是否启用调试。如果传入这个标志, 则会启用调试输出, 包括神经网络输入输出维度等, 便于调试。
-parser.add_argument('--debug', '-d', action='store_true', help='Enable Debugging')
-# 环境参数: 要保留最近的检查点文件个数。由于检查点文件体积较大, 如果磁盘空间不够的话, 可以少保留一些。默认全部保留(设置为0, 负数也可)。
-parser.add_argument('--keep_count', '-k', type=int, default=0, help='recent checkpoint files to keep')
-
-def train_model(start_epoch, epochs,
-                model: CaptionClipModel,
-                optimizer: Optimizer,
-                train_data, val_data,
-                checkpoint_file: str,
-                save_path: str,
-                keep_count: int,
-                vocab: list[str],
-                finetune_stage: int,
-                base_clip_lr: float,
-                type_,
-                print_freq: int,
-                grad_clip: float):
-    """
-    训练模型。
-    """
-
-    use_cuda = 'cuda' in type_
-    loss = nn.CrossEntropyLoss()
-    perplexity = AverageMeter()
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-
-    # 内置函数方便访问变量
-    def forward(model: CaptionClipModel, data, training=True, optimizer=None):
-
-        scaler = torch.amp.GradScaler('cuda')
-
-        timestamp = time.time()
-        for batch_idx, (imgs, (captions, lengths)) in enumerate(data):
-            data_time.update(time.time() - timestamp)
-            if use_cuda:
-                imgs = imgs.cuda()
-                captions = captions.cuda()
-
-            logging.debug(f"captions.size: {captions.size()}, lengths.size: {len(lengths)}")
-            logging.debug(f"captions: {captions[:3]}")
-            logging.debug(f"lengths: {lengths[:3]}")
-
-            # 输入应该是标题序列的前n-1个词（不包括最后的 <EOS>）
-            # 因为模型的目标是根据前面的词来预测下一个词。
-            input_captions = captions[:, :-1]
-            input_lengths = [l - 1 for l in lengths]
-
-            # 目标应该是标题序列的后n-1个词（不包括最开始的词）
-            # 我们希望模型在看到 w_i 后能预测出 w_{i+1}
-            target_captions = captions[:, 1:]
-            target_lengths = [l - 1 for l in lengths]
-
-            logging.debug(f"target_captions:{target_captions.size()}")
-            logging.debug(f"target_lengths: {target_lengths[:5]}")
-
-            # 混合精度训练: 加速
-            with torch.amp.autocast('cuda'):
-
-                pred, _ = model(imgs, input_captions, input_lengths)
-
-                # 打包目标序列
-                packed_targets = pack_padded_sequence(target_captions, target_lengths, batch_first=True)
-                target_flat = packed_targets.data
-
-                logging.debug(f"pred.size: {pred.size()}, target_flat.size: {target_flat.size()}")
-
-                err = loss(pred, target_flat)
-                perplexity.update(math.exp(err.item()))
-
-                if training:
-
-                    if optimizer is None:
-                        raise ValueError("Optimizer: 优化器不能为None")
-
-                    optimizer.zero_grad()
-                    scaler.scale(err).backward()
-                    clip_grad_norm_(model.parameters(), grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-
-            batch_time.update(time.time() - timestamp)
-            timestamp = time.time()
-
-            if batch_idx % print_freq == 0:
-                logging.info('{phase} - Epoch: [{0}][{1}/{2}]  '
-                             'Time {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                             'Data {data_time.val:.3f} ({data_time.avg:.3f})  '
-                             'Perplexity {perp.val:.4f} ({perp.avg:.4f})'.format(
-                                 epoch, batch_idx, len(data),
-                                 phase='TRAINING' if training else 'EVALUATING',
-                                 batch_time=batch_time,
-                                 data_time=data_time, perp=perplexity))
-
-        return perplexity.avg
+ENCODERS = ["RN50", "RN101", "RN50x4", "RN50x16", "RN50x64", "ViT-B/32", "ViT-B/16", "ViT-L/14", "ViT-L/14@336px"]
 
 
-    for epoch in range(start_epoch, epochs):
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train CLIP + projection + LSTM image captioning")
+    parser.add_argument("--train-images", type=Path, required=True, help="Training image directory")
+    parser.add_argument("--train-json", type=Path, required=True, help="COCO-style training annotations")
+    parser.add_argument("--val-images", type=Path, required=True, help="Validation image directory")
+    parser.add_argument("--val-json", type=Path, required=True, help="COCO-style validation annotations")
+    parser.add_argument("--encoder-model", "--encoder_model", default="ViT-B/32", choices=ENCODERS)
+    parser.add_argument("--embedding-size", "--embedding_size", default=256, type=int)
+    parser.add_argument("--rnn-size", "--rnn_size", default=256, type=int)
+    parser.add_argument("--num-layers", "--num_layers", default=2, type=int)
+    parser.add_argument("--max-length", "--max_length", default=30, type=int)
+    parser.add_argument("--finetune-stage", "--finetune_stage", default=4, type=int)
+    parser.add_argument("--start-epoch", "--start_epoch", default=0, type=int)
+    parser.add_argument("--optimizer", default="AdamW", choices=["SGD", "Adam", "AdamW", "RMSprop"])
+    parser.add_argument("--grad-clip", "--grad_clip", default=6.0, type=float)
+    parser.add_argument("--share-weights", "--share_weights", action="store_true")
+    parser.add_argument("-j", "--workers", default=0, type=int)
+    parser.add_argument("--epochs", default=40, type=int)
+    parser.add_argument("-b", "--batch-size", default=64, type=int)
+    parser.add_argument("--eval-batch-size", "--eval_batch_size", default=32, type=int)
+    parser.add_argument("--lr", "--learning-rate", default=5e-3, type=float)
+    parser.add_argument("--momentum", default=0.9, type=float)
+    parser.add_argument("--weight-decay", "--wd", default=1e-4, type=float)
+    parser.add_argument("--alpha", default=0.99, type=float)
+    parser.add_argument("--sgd-momentum", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--print-freq", "-p", default=20, type=int)
+    parser.add_argument("--results-dir", type=Path, default=Path("results"))
+    parser.add_argument("--save", default="")
+    parser.add_argument("--debug", "-d", action="store_true")
+    parser.add_argument("--keep-count", "-k", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--vocab-size", type=int, default=10_000)
+    return parser
 
-        model.train()
-        stage = model.finetune_clip(optimizer=optimizer,
-                                    current_epoch=epoch,
-                                    total_epochs=epochs,
-                                    base_clip_lr=base_clip_lr,
-                                    stages=finetune_stage)
 
-        # 训练
-        train_perp = forward(
-            model, train_data, training=True, optimizer=optimizer)
+def resolve_device(requested: str) -> torch.device:
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is unavailable")
+        return torch.device("cuda")
+    if requested == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        model.eval()
-        # 评估
-        val_perp = forward(model, val_data, training=False)
 
-        logging.info('\n Epoch: {0}\t'
-                     'Training Perplexity {train_perp:.4f} \t'
-                     'Validation Perplexity {val_perp:.4f} \n'
-                     .format(epoch + 1, train_perp=train_perp, val_perp=val_perp))
-
-        model.save_checkpoint(checkpoint_file % (epoch + 1), save_path, keep_count, epoch)
-
-def set_seed(seed=42):
-    """设置所有随机数生成器的种子以确保复现性"""
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # 如果使用多GPU
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    console.log(f"随机种子已设置为: {seed}", style="green")
-
-def main():
-    set_seed()
-
-    args = parser.parse_args()
-    save_path = os.path.join(args.results_dir, args.save)
-
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-
-    setup_logging(os.path.join(save_path, 'log.txt'), level=logging.DEBUG if args.debug else logging.INFO)
-    checkpoint_file = os.path.join(save_path, 'checkpoint_epoch_%s.pth')
-
-    logging.debug("训练参数: %s", args)
-
-    use_cuda = ('cuda' in args.type) and torch.cuda.is_available()
-
-    vocab = build_vocab()
-
-    model = CaptionClipModel(vocab, args.encoder_model,
-                         embedding_size=args.embedding_size,
-                         rnn_size=args.rnn_size,
-                         num_layers=args.num_layers,
-                         share_embedding_weights=args.share_weights,
-                         use_cuda=use_cuda)
-
-    train_data = get_iterator(get_coco_data(vocab, train=True),
-                              batch_size=args.batch_size,
-                              max_length=args.max_length,
-                              shuffle=True,
-                              num_workers=args.workers)
-
-    val_data = get_iterator(get_coco_data(vocab, train=False),
-                            batch_size=args.eval_batch_size,
-                            max_length=args.max_length,
-                            shuffle=False,
-                            num_workers=args.workers)
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-    if use_cuda:
-        cudnn.benchmark = True
-        model.cuda()
+def teacher_forcing_batch(captions: torch.Tensor, lengths: list[int]):
+    """Align image-first recurrent inputs with full caption targets.
 
-    clip_lr = args.lr * 0.005  # CLIP的学习率是基础的1 / 200
-    lstm_lr = args.lr
-    other_lr = args.lr
+    Input text excludes EOS. The recurrent output produced after the image
+    predicts the first token, so the packed target remains the full caption,
+    including EOS.
+    """
 
-    clip_params = []
-    lstm_params = []
-    other_params = []
+    if captions.dtype != torch.long:
+        raise TypeError("captions must be torch.long")
+    if any(length <= 0 for length in lengths):
+        raise ValueError("caption lengths must be positive")
+    return captions[:, :-1], [length - 1 for length in lengths], captions, lengths
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
 
-        if name.startswith('clip_model.'):
-            clip_params.append(param)
-        elif name.startswith('rnn.'):
-            lstm_params.append(param)
-        else:
-            other_params.append(param)
+def run_epoch(model, data, *, device: torch.device, training: bool, optimizer, grad_clip: float, print_freq: int, epoch: int) -> float:
+    loss_fn = nn.CrossEntropyLoss()
+    perplexity = AverageMeter()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    timestamp = time.time()
 
-    optimizer = select_optimizer(args.optimizer,
-                                clip_param_group=(clip_params, clip_lr),
-                                lstm_param_group=(lstm_params, lstm_lr),
-                                other_param_group=(other_params, other_lr),
-                                **{'momentum': args.momentum,
-                                'alpha': args.alpha,
-                                'enable_sgd_momentum': args.enable_sgd_momentum,
-                                'weight_decay': args.weight_decay}
-    )
+    for batch_idx, (images, (captions, lengths)) in enumerate(data):
+        data_time.update(time.time() - timestamp)
+        images = images.to(device, non_blocking=use_amp)
+        captions = captions.to(device, non_blocking=use_amp)
+        input_captions, input_lengths, target_captions, target_lengths = teacher_forcing_batch(captions, lengths)
 
-    finetune_stage = args.finetune_stage
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        amp_context = torch.amp.autocast("cuda") if use_amp else nullcontext()
+        with amp_context:
+            predictions, _ = model(images, input_captions, input_lengths)
+            packed_targets = pack_padded_sequence(
+                target_captions,
+                target_lengths,
+                batch_first=True,
+                enforce_sorted=True,
+            )
+            error = loss_fn(predictions, packed_targets.data)
 
-    console.log(f"使用设备:{next(model.parameters()).device}", style="bold blue")
+        if training:
+            scaler.scale(error).backward()
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
 
-    train_model(args.start_epoch,
-                args.epochs,
+        perplexity.update(math.exp(min(error.item(), 20.0)), n=images.shape[0])
+        batch_time.update(time.time() - timestamp)
+        timestamp = time.time()
+        if batch_idx % print_freq == 0:
+            logging.info(
+                "%s epoch=%s batch=%s/%s time=%.3f data=%.3f perplexity=%.4f",
+                "train" if training else "val",
+                epoch,
+                batch_idx,
+                len(data),
+                batch_time.val,
+                data_time.val,
+                perplexity.val,
+            )
+    return perplexity.avg
+
+
+def train_model(
+    *,
+    start_epoch: int,
+    epochs: int,
+    model,
+    optimizer,
+    train_data,
+    val_data,
+    checkpoint_pattern: str,
+    save_path: str,
+    keep_count: int,
+    finetune_stage: int,
+    base_clip_lr: float,
+    device: torch.device,
+    print_freq: int,
+    grad_clip: float,
+) -> None:
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        model.finetune_clip(
+            optimizer=optimizer,
+            current_epoch=epoch,
+            total_epochs=epochs,
+            base_clip_lr=base_clip_lr,
+            stages=finetune_stage,
+        )
+        train_perplexity = run_epoch(
+            model,
+            train_data,
+            device=device,
+            training=True,
+            optimizer=optimizer,
+            grad_clip=grad_clip,
+            print_freq=print_freq,
+            epoch=epoch + 1,
+        )
+        model.eval()
+        with torch.no_grad():
+            val_perplexity = run_epoch(
                 model,
-                optimizer,
-                train_data,
                 val_data,
-                checkpoint_file,
-                save_path,
-                args.keep_count,
-                vocab,
-                finetune_stage,
-                base_clip_lr=clip_lr,
-                type_=args.type,
-                print_freq=args.print_freq,
-                grad_clip=args.grad_clip
+                device=device,
+                training=False,
+                optimizer=optimizer,
+                grad_clip=grad_clip,
+                print_freq=print_freq,
+                epoch=epoch + 1,
+            )
+        logging.info(
+            "epoch=%s train_perplexity=%.4f val_perplexity=%.4f",
+            epoch + 1,
+            train_perplexity,
+            val_perplexity,
+        )
+        model.save_checkpoint(checkpoint_pattern % (epoch + 1), save_path, keep_count, epoch + 1)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.epochs <= 0 or args.batch_size <= 0 or args.eval_batch_size <= 0:
+        raise ValueError("epochs and batch sizes must be positive")
+    if args.start_epoch < 0 or args.start_epoch >= args.epochs:
+        raise ValueError("start-epoch must be in [0, epochs)")
+
+    set_seed(args.seed)
+    device = resolve_device(args.device)
+    save_path = args.results_dir / args.save
+    save_path.mkdir(parents=True, exist_ok=True)
+    setup_logging(str(save_path / "log.txt"), level=logging.DEBUG if args.debug else logging.INFO)
+
+    vocab = build_vocab(args.train_json, num_words=args.vocab_size)
+    from model import CaptionClipModel
+
+    model = CaptionClipModel(
+        vocab,
+        args.encoder_model,
+        embedding_size=args.embedding_size,
+        rnn_size=args.rnn_size,
+        num_layers=args.num_layers,
+        share_embedding_weights=args.share_weights,
+        use_cuda=device.type == "cuda",
+    ).to(device)
+
+    train_data = get_iterator(
+        get_coco_data(vocab, root=args.train_images, ann_file=args.train_json, train=True),
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+    )
+    val_data = get_iterator(
+        get_coco_data(vocab, root=args.val_images, ann_file=args.val_json, train=False),
+        batch_size=args.eval_batch_size,
+        max_length=args.max_length,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
     )
 
-if __name__ == '__main__':
-    main()
+    clip_params = list(model.clip_model.parameters())
+    lstm_params = list(model.rnn.parameters())
+    reserved = {id(parameter) for parameter in [*clip_params, *lstm_params]}
+    other_params = [parameter for parameter in model.parameters() if id(parameter) not in reserved]
+    clip_lr = args.lr * 0.005
+    optimizer = select_optimizer(
+        args.optimizer,
+        clip_param_group=(clip_params, clip_lr),
+        lstm_param_group=(lstm_params, args.lr),
+        other_param_group=(other_params, args.lr),
+        momentum=args.momentum,
+        alpha=args.alpha,
+        enable_sgd_momentum=args.sgd_momentum,
+        weight_decay=args.weight_decay,
+    )
+
+    console.log(f"device={device} vocab={len(vocab)} train={len(train_data.dataset)} val={len(val_data.dataset)}")
+    train_model(
+        start_epoch=args.start_epoch,
+        epochs=args.epochs,
+        model=model,
+        optimizer=optimizer,
+        train_data=train_data,
+        val_data=val_data,
+        checkpoint_pattern=str(save_path / "checkpoint_epoch_%s.pth"),
+        save_path=str(save_path),
+        keep_count=args.keep_count,
+        finetune_stage=args.finetune_stage,
+        base_clip_lr=clip_lr,
+        device=device,
+        print_freq=args.print_freq,
+        grad_clip=args.grad_clip,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
